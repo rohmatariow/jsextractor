@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 
@@ -76,6 +77,8 @@ def load_cookie_file(cookie_file: str) -> str:
 
                 parts = line.split("\t")
 
+                # Netscape cookie format has 7 fields:
+                # domain, flag, path, secure, expiration, name, value
                 if len(parts) >= 7:
                     name = parts[5].strip()
                     value = parts[6].strip()
@@ -110,11 +113,14 @@ def extract_js_urls(base_url: str, html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     urls = set()
 
+    # <script src="...">
     for tag in soup.find_all("script"):
         src = tag.get("src")
         if src:
             urls.add(urljoin(base_url, src))
 
+    # <link rel="preload" as="script" href="...">
+    # <link rel="modulepreload" href="...">
     for tag in soup.find_all("link"):
         href = tag.get("href")
         as_attr = (tag.get("as") or "").lower()
@@ -123,6 +129,7 @@ def extract_js_urls(base_url: str, html: str) -> list[str]:
         if href and (as_attr == "script" or "modulepreload" in rel):
             urls.add(urljoin(base_url, href))
 
+    # Fallback for Next.js hydration payload / inline JS references
     for match in re.findall(r'["\']([^"\']+?\.js(?:\?[^"\']*)?)["\']', html):
         urls.add(urljoin(base_url, match))
 
@@ -156,6 +163,12 @@ def download_file(session: requests.Session, url: str, outdir: Path, timeout: in
 def build_session(args) -> requests.Session:
     session = requests.Session()
 
+    # TLS verification. -k/--insecure mirrors curl -k (needed for self-signed /
+    # localhost / hostname-mismatch certs). Applies to page fetch and downloads.
+    session.verify = not args.insecure
+    if args.insecure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     default_headers = {
         "User-Agent": args.user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -177,6 +190,8 @@ def build_session(args) -> requests.Session:
             cookie_values.append(loaded_cookie)
 
     if cookie_values:
+        # If user also passed -H "Cookie: ...", this will override/merge into Cookie header.
+        # Final Cookie header becomes all cookie sources joined by "; ".
         existing_cookie = session.headers.get("Cookie")
         if existing_cookie:
             cookie_values.insert(0, existing_cookie)
@@ -216,8 +231,8 @@ Examples:
     parser.add_argument(
         "-o",
         "--output",
-        required=True,
-        help="Output directory for downloaded JavaScript files",
+        default=None,
+        help="Output directory for downloaded JS. Default: js_<hostname>",
     )
 
     parser.add_argument(
@@ -257,7 +272,26 @@ Examples:
         help="Cookie file in Netscape/curl cookie jar format",
     )
 
+    parser.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification (like curl -k). "
+             "Needed for self-signed / localhost / hostname-mismatch certs.",
+    )
+
+    parser.add_argument(
+        "--no-redirect",
+        action="store_true",
+        help="Do not follow redirects on the initial page fetch (like curl without -L). "
+             "Useful to see auth 3xx instead of silently landing on a login page.",
+    )
+
     args = parser.parse_args()
+
+    if not args.output:
+        host = urlparse(args.url).netloc.replace(":", "_") or "site"
+        args.output = f"js_{host}"
 
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -268,11 +302,22 @@ Examples:
         parser.error(str(e))
 
     try:
-        resp = session.get(args.url, timeout=args.timeout, allow_redirects=True)
+        resp = session.get(
+            args.url,
+            timeout=args.timeout,
+            allow_redirects=not args.no_redirect,
+        )
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"[error] failed to fetch page: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if resp.history:
+        chain = " -> ".join(str(r.status_code) for r in resp.history)
+        print(f"[warn] redirected ({chain}) to: {resp.url}")
+        if any(x in resp.url.lower() for x in ("login", "/auth")):
+            print("[warn] landed on an auth/login page — session cookie likely expired/invalid")
+            print("[warn] JS will be scraped from the login page, NOT the target")
 
     js_urls = extract_js_urls(resp.url, resp.text)
 
